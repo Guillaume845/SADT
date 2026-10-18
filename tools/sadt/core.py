@@ -43,7 +43,7 @@ class SADTConfig:
     topk_patches: int = 3
     patches_to_mask_per_word: int = 2
     model_image_size: int = 336
-    image_token_count: int = 576
+    image_token_count: int = 576  # overridden dynamically from input_ids; kept for backward compat
     grid_size: int = 24
     veed_alpha: float = 0.0
     semantic_matcher: str = "predefined"
@@ -353,6 +353,72 @@ def _response_ids(output: Any, input_ids: torch.Tensor) -> List[int]:
     return seq_list[1:] if seq_list else []
 
 
+_QWEN2VL_IMAGE_PAD_TOKEN_ID = 151655
+
+
+def _get_img_span(input_ids: torch.Tensor) -> Tuple[int, int]:
+    """Return (img_idx, image_token_count) from input_ids for LLaVA or Qwen2VL."""
+    ids = input_ids[0]
+    llava_mask = ids == -200
+    if llava_mask.any():
+        return int(llava_mask.nonzero()[0].item()), 576
+    pad_mask = ids == _QWEN2VL_IMAGE_PAD_TOKEN_ID
+    if pad_mask.any():
+        positions = pad_mask.nonzero().squeeze(1)
+        return int(positions[0].item()), int(len(positions))
+    raise ValueError("No image tokens found in input_ids")
+
+
+def _generate_qwen2vl(
+    model: Any,
+    processor: Any,
+    image_file: str,
+    prompt: str,
+    *,
+    pil_image: Optional[Any] = None,
+    temperature: float = 0.0,
+    top_p: Optional[float] = None,
+    num_beams: int = 1,
+    max_new_tokens: int = 256,
+    logits_processor: Optional[Any] = None,
+) -> Tuple[Any, torch.Tensor, str]:
+    from qwen_vl_utils import process_vision_info
+
+    img_src = pil_image if pil_image is not None else Image.open(image_file).convert("RGB")
+    messages = [{"role": "user", "content": [
+        {"type": "image", "image": img_src},
+        {"type": "text", "text": prompt},
+    ]}]
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    image_inputs, _ = process_vision_info(messages)
+    inputs = processor(text=[text], images=image_inputs, padding=True, return_tensors="pt").to(model.device)
+    input_ids = inputs["input_ids"]
+
+    gen_kwargs: Dict[str, Any] = dict(
+        **inputs,
+        max_new_tokens=max_new_tokens,
+        output_attentions=True,
+        output_hidden_states=True,
+        return_dict_in_generate=True,
+        do_sample=temperature > 0,
+    )
+    if temperature > 0:
+        gen_kwargs["temperature"] = temperature
+        if top_p is not None:
+            gen_kwargs["top_p"] = top_p
+    if num_beams > 1:
+        gen_kwargs["num_beams"] = num_beams
+    if logits_processor is not None:
+        gen_kwargs["logits_processor"] = logits_processor
+
+    with torch.no_grad():
+        output = model.generate(**gen_kwargs)
+
+    generated_ids = output["sequences"][:, input_ids.shape[1]:]
+    text_out = processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
+    return output, input_ids, text_out
+
+
 def generate_with_trace(
     model: Any,
     tokenizer: Any,
@@ -362,6 +428,7 @@ def generate_with_trace(
     prompt: str,
     *,
     image_tensor: Optional[torch.Tensor] = None,
+    pil_image: Optional[Any] = None,
     image_sizes: Optional[List[Tuple[int, int]]] = None,
     temperature: float = 0.0,
     top_p: Optional[float] = None,
@@ -373,6 +440,14 @@ def generate_with_trace(
     hallu_logits: Optional[Sequence[torch.Tensor]] = None,
     cd_alpha: Optional[float] = None,
 ) -> Tuple[Any, torch.Tensor, str]:
+    if model_name == "qwen2vl":
+        return _generate_qwen2vl(
+            model, tokenizer, image_file, prompt,
+            pil_image=pil_image,
+            temperature=temperature, top_p=top_p, num_beams=num_beams,
+            max_new_tokens=max_new_tokens, logits_processor=logits_processor,
+        )
+
     from llava.eval.run_llava import eval_model
     from llava.mm_utils import process_images
 
@@ -455,7 +530,7 @@ def filter_words_by_image_attention(
     """
     attentions = output["attentions"]
     generated_ids = _response_ids(output, input_ids)
-    img_idx = int(torch.nonzero(input_ids[0] == -200).squeeze().item())
+    img_idx, _image_token_count = _get_img_span(input_ids)
     object_words: List[str] = []
     filtered_words: List[str] = []
     missing_words: List[str] = []
@@ -480,7 +555,7 @@ def filter_words_by_image_attention(
             attentions,
             indices[0],
             img_idx,
-            config.image_token_count,
+            _image_token_count,
         )
         avg_attention = float(attention_img[list(config.image_attention_layers)].sum(axis=1).mean())
         attention_scores[word] = avg_attention
@@ -511,7 +586,7 @@ def detect_hallucinations(
     attentions = output["attentions"]
     hidden_states = output["hidden_states"][0]
     generated_ids = _response_ids(output, input_ids)
-    img_idx = int(torch.nonzero(input_ids[0] == -200).squeeze().item())
+    img_idx, _image_token_count = _get_img_span(input_ids)
     detections: List[SADTDetection] = []
 
     for raw_word in words:
@@ -528,7 +603,7 @@ def detect_hallucinations(
             continue
 
         token_idx = token_indices[0]
-        attention_img = _attention_for_token(attentions, token_idx, img_idx, config.image_token_count)
+        attention_img = _attention_for_token(attentions, token_idx, img_idx, _image_token_count)
         avg_attention = float(attention_img[list(config.image_attention_layers)].sum(axis=1).mean())
         is_object = avg_attention > config.image_attention_threshold
         top_patch_indices = _top_patches_across_layers(
@@ -664,7 +739,7 @@ def build_vcd_hallucination_guidance(
 
     hidden_states = output["hidden_states"][0]
     generated_ids = _response_ids(output, input_ids)
-    img_idx = int(torch.nonzero(input_ids[0] == -200).squeeze().item())
+    img_idx, _ = _get_img_span(input_ids)
     trigger_token_ids: List[int] = []
     evidence_logits: List[torch.Tensor] = []
     layer_index = hidden_layer_index

@@ -58,7 +58,12 @@ def image_sort_key(path: Path) -> Tuple[int, str]:
     return (int(digits) if digits else 10**18, path.name)
 
 
-def collect_images(image_file: Optional[str], image_dir: Optional[str], limit: Optional[int]) -> List[str]:
+def collect_images(
+    image_file: Optional[str],
+    image_dir: Optional[str],
+    limit: Optional[int],
+    offset: int = 0,
+) -> List[str]:
     if image_file:
         return [image_file]
     if not image_dir:
@@ -68,6 +73,8 @@ def collect_images(image_file: Optional[str], image_dir: Optional[str], limit: O
         [path for path in Path(image_dir).iterdir() if path.suffix.lower() in exts],
         key=image_sort_key,
     )
+    if offset:
+        images = images[offset:]
     if limit is not None:
         images = images[:limit]
     return [str(path) for path in images]

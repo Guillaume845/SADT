@@ -1,0 +1,6 @@
+
+- name: SpectralRAUQ   # S1 x B3  <-- current paper baseline "Ours"
+  cfg: {alpha: 0, use_entropy: False, selection_mode: "square", head_selection_weighting: "euclidean", attn_mode: "full_square", mass: "attn_mass", rank_estimator: "pr"}
+
+- name: SpectralRAUQ   # S1 x B4 "Ours with centered PR""
+  cfg: {alpha: 0.2, use_entropy: False, selection_mode: "square", head_selection_weighting: "euclidean", attn_mode: "full_square", mass: "attn_mass", rank_estimator: "pr_wc_centered"}

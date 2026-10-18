@@ -153,6 +153,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         # inputs_embeds = inputs_embeds[:, keep_indices, :] 
 
         return super().generate(
+            input_ids=inputs,
             position_ids=position_ids,
             attention_mask=attention_mask,
             inputs_embeds=inputs_embeds,
